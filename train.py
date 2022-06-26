@@ -23,6 +23,7 @@ from argparse import ArgumentParser
 #     VectorObservationWrapper, \
 #     VisualObservationWrapper, \
 #     Logger
+from wrappers import TimeLimit
 from ray.rllib.evaluation.metrics import collect_episodes, summarize_episodes
 
 from model import GridBaselineModel, PovBaselineModel
@@ -54,11 +55,46 @@ def evaluate_separately(trainer, eval_workers):
         episodes, _ = collect_episodes(
             remote_workers=eval_workers.remote_workers(), timeout_seconds=99999)
         all_episodes += episodes
+
     metrics = summarize_episodes(episodes)
     for eid, ep in zip(env_ids, all_episodes):
         metrics[f'env_{eid}_reward'] = ep.episode_reward
     return metrics
 
+
+def evaluate_separately_mistakes(trainer, eval_workers):
+    global glob_i, glob_step
+    glob_step += 1
+    w = next(iter(eval_workers.remote_workers()))
+    # env_ids = ray.get(w.foreach_env.remote(lambda env: list(env.tasks.preset.keys())))[0]
+    env_ids = [0 for _ in range(5)] # eval 5 episodes
+    print(f'env id: {env_ids}')
+    i = 0
+    all_episodes = []
+    while i < len(env_ids):
+        for w in eval_workers.remote_workers():
+            w.foreach_env.remote(lambda env: (
+                env.turn_on(),
+                env.enable_renderer(), 
+                env.set_idx(glob_i + i, glob_step)
+            ))
+            i += 1
+        glob_i += i
+        ray.get([w.sample.remote() for w in eval_workers.remote_workers()])
+        episodes, _ = collect_episodes(
+            remote_workers=eval_workers.remote_workers(), timeout_seconds=99999)
+        all_episodes += episodes
+        print("Here are episodes")
+        print(episodes)
+    metrics = summarize_episodes(episodes)
+    print("Here are metrics!")
+    print(metrics)
+    for eid, ep in zip(env_ids, all_episodes):
+        print("Episode")
+        print(ep)
+        metrics[f'env_{eid}_reward'] = ep.episode_reward
+    exit(1)
+    return metrics
 
 # def build_env(env_config=None, env_factory=None):
 #     """
@@ -113,6 +149,14 @@ def evaluate_separately(trainer, eval_workers):
 #         env = SizeReward(env)
 #     env = TimeLimit(env, limit=env_config['time_limit'])
 #     return env
+
+class MyWrapper(gym.Wrapper):
+  def reset(self):
+    obs = super().reset()
+    del obs['dialog']
+  def step(self, action):
+    obs, r, d, i = super().step(action)
+    del obs['dialog']
 
 def build_gw_env(env_config=None, env_factory=None):
     """
@@ -170,7 +214,18 @@ def build_gw_env(env_config=None, env_factory=None):
     # if env_config.get('size_reward', False):
     #     env = SizeReward(env)
     # env = TimeLimit(env, limit=env_config['time_limit'])
-    env = create_env(visual=False, discretize=True, size_reward=True, select_and_place=True, log_actions=False)
+    env = create_env(render=False, discretize=True, size_reward=True, select_and_place=True, vector_state=True, target_in_obs=True)
+    env = TimeLimit(env, limit=env_config['time_limit'])
+
+
+
+    from gridworld.data import IGLUDataset
+
+    # enable per task translation-invariant reward
+    iglu_dataset = IGLUDataset(task_kwargs={'invariant': False}) 
+    env.set_task_generator(iglu_dataset)
+
+    obs = env.reset()
     return env
 
 def register_models():
@@ -204,7 +259,7 @@ if __name__ == '__main__':
         run = config[key]['run']
         print(config)
         del config[key]['env'], config[key]['run']
-        # config[key]['config']['custom_eval_function'] = evaluate_separately
+        # config[key]['config']['custom_eval_function'] = evaluate_separately_mistakes
         if args.local:
             # config[key]['config']['num_workers'] = 1
             config[key]['stop']['timesteps_total'] = 300000
@@ -216,5 +271,8 @@ if __name__ == '__main__':
             loggers = DEFAULT_LOGGERS + (WandbLogger, )
         else:
             loggers = DEFAULT_LOGGERS
+
+        # for interactive learning, we need custom metrics at training time to see if advice is being followed
+        # config["callbacks"] = InteractiveCallbacks
             
-        tune.run(run, **config[key], loggers=loggers)
+        tune.run(run, **config[key])
